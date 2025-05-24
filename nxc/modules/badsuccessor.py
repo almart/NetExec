@@ -230,22 +230,20 @@ class NXCModule:
             self.domain_name = '.'.join(parts)
             self.context.log.debug(f"Derived domain name: {self.domain_name}")
 
-            # Get schema naming context from RootDSE using direct ldap_connection method
+            # Get schema naming context from RootDSE using NetExec's method
+            from impacket.ldap import ldapasn1 as ldapasn1_impacket
             root_dse = connection.ldap_connection.search(
-                searchFilter="(objectClass=*)",
+                scope=ldapasn1_impacket.Scope("baseObject"),
                 attributes=["schemaNamingContext"],
-                searchBase="",
                 sizeLimit=0
             )
             
-            # Process RootDSE response
-            for entry in root_dse:
-                if hasattr(entry, 'getAttributes'):
-                    attrs = entry.getAttributes()
-                    if 'schemaNamingContext' in attrs and attrs['schemaNamingContext']:
-                        self.schema_naming_context = str(attrs['schemaNamingContext'][0])
-                        self.context.log.debug(f"Schema naming context: {self.schema_naming_context}")
-                        return True
+            # Process RootDSE response using NetExec's parse_result_attributes
+            resp_parsed = parse_result_attributes(root_dse)
+            if resp_parsed and "schemaNamingContext" in resp_parsed[0]:
+                self.schema_naming_context = resp_parsed[0]["schemaNamingContext"]
+                self.context.log.debug(f"Schema naming context: {self.schema_naming_context}")
+                return True
             
             self.context.log.error("Could not retrieve schema naming context.")
             return False
