@@ -232,7 +232,8 @@ class NXCModule:
             self.context.log.debug(f"Derived domain name: {self.domain_name}")
 
             # Get schema naming context
-            root_dse = connection.ldap_connection.search(searchBase="", searchFilter="(objectClass=*)", attributes=["schemaNamingContext"], searchScope=ldap.SCOPE_BASE)
+            # Corrected ldap.SCOPE_BASE to ldap.LDAP_SCOPE_BASE
+            root_dse = connection.ldap_connection.search(searchBase="", searchFilter="(objectClass=*)", attributes=["schemaNamingContext"], searchScope=ldap.LDAP_SCOPE_BASE)
             parsed_root_dse = parse_result_attributes(root_dse)
             if parsed_root_dse and "schemaNamingContext" in parsed_root_dse[0]:
                 self.schema_naming_context = parsed_root_dse[0]["schemaNamingContext"]
