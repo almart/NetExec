@@ -230,22 +230,49 @@ class NXCModule:
             self.domain_name = '.'.join(parts)
             self.context.log.debug(f"Derived domain name: {self.domain_name}")
 
-            # Get schema naming context from RootDSE using NetExec's method
-            from impacket.ldap import ldapasn1 as ldapasn1_impacket
-            root_dse = connection.ldap_connection.search(
-                scope=ldapasn1_impacket.Scope("baseObject"),
-                attributes=["schemaNamingContext"],
-                sizeLimit=0
-            )
-            
-            # Process RootDSE response using NetExec's parse_result_attributes
-            resp_parsed = parse_result_attributes(root_dse)
-            if resp_parsed and "schemaNamingContext" in resp_parsed[0]:
-                self.schema_naming_context = resp_parsed[0]["schemaNamingContext"]
-                self.context.log.debug(f"Schema naming context: {self.schema_naming_context}")
+            # Try to get schema naming context from RootDSE
+            try:
+                self.context.log.debug("Attempting RootDSE query for schema naming context...")
+                root_dse = connection.ldap_connection.search(
+                    scope=ldapasn1.Scope("baseObject"),
+                    attributes=["schemaNamingContext", "configurationNamingContext"],
+                    sizeLimit=0
+                )
+                self.context.log.debug(f"RootDSE query completed, response type: {type(root_dse)}")
+                
+                resp_parsed = parse_result_attributes(root_dse)
+                self.context.log.debug(f"Parsed response: {resp_parsed}")
+                if resp_parsed and len(resp_parsed) > 0:
+                    root_attrs = resp_parsed[0]
+                    self.context.log.debug(f"Root attributes available: {list(root_attrs.keys())}")
+                    # First try to get schemaNamingContext directly
+                    if "schemaNamingContext" in root_attrs:
+                        self.schema_naming_context = root_attrs["schemaNamingContext"]
+                        self.context.log.debug(f"Schema naming context from RootDSE: {self.schema_naming_context}")
+                        return True
+                    
+                    # Fallback: construct from configurationNamingContext
+                    if "configurationNamingContext" in root_attrs:
+                        config_nc = root_attrs["configurationNamingContext"]
+                        self.schema_naming_context = f"CN=Schema,{config_nc}"
+                        self.context.log.debug(f"Schema naming context constructed from config: {self.schema_naming_context}")
+                        return True
+                else:
+                    self.context.log.debug("RootDSE query returned no results")
+            except Exception as e:
+                self.context.log.debug(f"RootDSE query failed: {e}")
+
+            # Final fallback: construct schema naming context from base DN
+            # This is the standard location for AD schema
+            base_dn = connection.ldap_connection._baseDN
+            # Replace first DC= with CN=Configuration,DC= to get configuration naming context
+            if base_dn.upper().startswith('DC='):
+                config_dn = base_dn.replace('DC=', 'CN=Configuration,DC=', 1)
+                self.schema_naming_context = f"CN=Schema,{config_dn}"
+                self.context.log.debug(f"Schema naming context (standard fallback): {self.schema_naming_context}")
                 return True
             
-            self.context.log.error("Could not retrieve schema naming context.")
+            self.context.log.error("Could not determine schema naming context.")
             return False
         except Exception as e:
             self.context.log.error(f"Error getting domain/schema info: {e}")
