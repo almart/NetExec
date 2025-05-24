@@ -230,17 +230,23 @@ class NXCModule:
             self.domain_name = '.'.join(parts)
             self.context.log.debug(f"Derived domain name: {self.domain_name}")
 
-            # Get schema naming context from RootDSE
-            root_dse = connection.search(
+            # Get schema naming context from RootDSE using direct ldap_connection method
+            root_dse = connection.ldap_connection.search(
                 searchFilter="(objectClass=*)",
                 attributes=["schemaNamingContext"],
-                baseDN=""
+                searchBase="",
+                sizeLimit=0
             )
-            parsed_root_dse = parse_result_attributes(root_dse)
-            if parsed_root_dse and "schemaNamingContext" in parsed_root_dse[0]:
-                self.schema_naming_context = parsed_root_dse[0]["schemaNamingContext"]
-                self.context.log.debug(f"Schema naming context: {self.schema_naming_context}")
-                return True
+            
+            # Process RootDSE response
+            for entry in root_dse:
+                if hasattr(entry, 'getAttributes'):
+                    attrs = entry.getAttributes()
+                    if 'schemaNamingContext' in attrs and attrs['schemaNamingContext']:
+                        self.schema_naming_context = str(attrs['schemaNamingContext'][0])
+                        self.context.log.debug(f"Schema naming context: {self.schema_naming_context}")
+                        return True
+            
             self.context.log.error("Could not retrieve schema naming context.")
             return False
         except Exception as e:
@@ -566,22 +572,3 @@ class NXCModule:
 
         else:
             context.log.error(f"Unknown action: {self.action}")
-
-        # Original logging from on_login (can be removed or adapted if covered by 'check' action)
-        # context.log.debug(f"Found {len(resp)} entries") # resp is not defined here anymore in this scope
-        # results = self.find_bad_successor_ous(connection.ldap_connection, resp, connection.ldap_connection._baseDN)
-        # if results:
-        #     context.log.success(f"Found {len(results)} results")
-        # else:
-        #     context.log.highlight("No account found")
-        # for sid, ous in results.items():
-        #     samaccountname = self.resolve_sid_to_name(
-        #         connection.ldap_connection,
-        #         sid,
-        #         connection.ldap_connection._baseDN
-        #     )
-        #     for ou in ous:
-        #         if sid == samaccountname:
-        #             context.log.highlight(f"{sid}, {ou}")
-        #         else:
-        #             context.log.highlight(f"{samaccountname} ({sid}), {ou}")
