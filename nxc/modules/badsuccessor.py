@@ -232,8 +232,17 @@ class NXCModule:
             self.context.log.debug(f"Derived domain name: {self.domain_name}")
 
             # Get schema naming context
-            # Using literal 0 for SCOPE_BASE_OBJECT due to persistent AttributeError
-            root_dse = connection.ldap_connection.search(searchBase="", searchFilter="(objectClass=*)", attributes=["schemaNamingContext"], searchScope=0)
+            # Corrected the search call to use positional arguments for scope and others
+            root_dse = connection.ldap_connection.search(
+                searchBase="",
+                scope=ldap.SCOPE_BASE,  # Or use integer 0
+                derefAliases=ldap.DEREF_NEVER, # Or use integer 0
+                sizeLimit=0,
+                timeLimit=0,
+                typesOnly=0,
+                searchFilter="(objectClass=*)",
+                attributes=["schemaNamingContext"]
+            )
             parsed_root_dse = parse_result_attributes(root_dse)
             if parsed_root_dse and "schemaNamingContext" in parsed_root_dse[0]:
                 self.schema_naming_context = parsed_root_dse[0]["schemaNamingContext"]
